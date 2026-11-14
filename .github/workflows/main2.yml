@@ -1,0 +1,164 @@
+
+name: MacCloud SSH
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Online duration in minutes"
+        required: true
+        default: "180"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  maccloud:
+    name: MacCloud macOS Server
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Validate secrets and duration
+        shell: bash
+        env:
+          DURATION: ${{ inputs.duration }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          TS_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_CLIENT_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$DURATION" =~ ^[0-9]+$ ]] ||
+             (( DURATION < 15 || DURATION > 340 )); then
+            echo "::error::Duration must be 15-340 minutes."
+            exit 1
+          fi
+
+          if [[ -z "$SSH_PASSWORD" ||
+                -z "$TS_CLIENT_ID" ||
+                -z "$TS_CLIENT_SECRET" ]]; then
+            echo "::error::Missing required GitHub secrets."
+            exit 1
+          fi
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:maccloud
+
+      - name: Configure SSH password
+        shell: bash
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          USER_NAME="$(id -un)"
+
+          echo "Configuring password for $USER_NAME"
+
+          sudo dscl . -passwd \
+            "/Users/$USER_NAME" "$SSH_PASSWORD"
+
+          echo "Password configured."
+
+      - name: Enable SSH password authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CONFIG="/etc/ssh/sshd_config"
+          TEMP_CONFIG="$(mktemp)"
+
+          {
+            echo "PasswordAuthentication yes"
+            echo "KbdInteractiveAuthentication no"
+            echo "UsePAM yes"
+            echo "PermitRootLogin no"
+            echo "AllowUsers $(id -un)"
+            cat "$CONFIG"
+          } > "$TEMP_CONFIG"
+
+          sudo install -m 644 "$TEMP_CONFIG" "$CONFIG"
+          rm -f "$TEMP_CONFIG"
+
+          sudo systemsetup -setremotelogin on
+
+          sudo /usr/sbin/sshd -t
+
+          sudo launchctl kickstart -k \
+            system/com.openssh.sshd
+
+          echo "SSH server enabled."
+
+      - name: Verify SSH configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo /usr/sbin/sshd -T |
+            grep -E 'passwordauthentication|kbdinteractiveauthentication|usepam|allowusers'
+
+          nc -z 127.0.0.1 22
+
+          echo "SSH server is listening on port 22."
+
+      - name: Display MacCloud connection details
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          USER_NAME="$(id -un)"
+          IP="$(tailscale ip -4)"
+
+          echo ""
+          echo "======================================"
+          echo "          MACCLOUD ONLINE"
+          echo "======================================"
+          echo "Operating System:"
+          sw_vers -productVersion
+
+          echo "Architecture:"
+          uname -m
+
+          echo "Username:"
+          echo "$USER_NAME"
+
+          echo "Tailscale IP:"
+          echo "$IP"
+
+          echo "SSH Port:"
+          echo "22"
+
+          echo ""
+          echo "CONNECT COMMAND:"
+          echo "ssh $USER_NAME@$IP"
+          echo "======================================"
+
+          echo ""
+          echo "Xcode:"
+          xcodebuild -version || true
+
+          echo ""
+          echo "Swift:"
+          swift --version || true
+
+      - name: Keep MacCloud online
+        shell: bash
+        env:
+          DURATION: ${{ inputs.duration }}
+        run: |
+          echo "MacCloud will run for $DURATION minutes."
+
+          sleep "$((DURATION * 60))"
+
+      - name: Shutdown SSH
+        if: always()
+        shell: bash
+        run: |
+          sudo systemsetup -setremotelogin off || true
+          echo "MacCloud SSH stopped."
