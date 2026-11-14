@@ -1,0 +1,205 @@
+
+name: MacCloud SSH Test2
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "How long should MacCloud stay online (minutes)"
+        required: true
+        default: "180"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  maccloud:
+    name: Start macOS SSH machine
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Validate settings
+        shell: bash
+        env:
+          DURATION_MINUTES: ${{ inputs.duration }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$DURATION_MINUTES" =~ ^[0-9]+$ ]]; then
+            echo "Duration must be a number."
+            exit 1
+          fi
+
+          if (( DURATION_MINUTES < 15 || DURATION_MINUTES > 340 )); then
+            echo "Duration must be between 15 and 340 minutes."
+            exit 1
+          fi
+
+          echo "MacCloud duration: $DURATION_MINUTES minutes"
+
+      - name: Create MacCloud SSH user
+        shell: bash
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          SSH_USER="maccloud"
+
+          if [[ -z "$SSH_PASSWORD" ]]; then
+            echo "SSH_PASSWORD secret is missing."
+            exit 1
+          fi
+
+          if id "$SSH_USER" >/dev/null 2>&1; then
+            echo "SSH user already exists."
+            exit 1
+          fi
+
+          echo "Creating dedicated SSH account..."
+
+          sudo sysadminctl \
+            -addUser "$SSH_USER" \
+            -fullName "MacCloud SSH" \
+            -password "$SSH_PASSWORD"
+
+          if ! id "$SSH_USER" >/dev/null 2>&1; then
+            echo "Could not create MacCloud user."
+            exit 1
+          fi
+
+          echo "MacCloud user created successfully."
+
+      - name: Enable SSH password authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SSH_USER="maccloud"
+          SSHD_CONFIG="/etc/ssh/sshd_config"
+          TEMP_CONFIG="$(mktemp)"
+
+          echo "Configuring SSH..."
+
+          # Enable the SSH access group if necessary.
+          sudo dseditgroup -o create com.apple.access_ssh 2>/dev/null || true
+
+          sudo dseditgroup \
+            -o edit \
+            -a "$SSH_USER" \
+            -t user \
+            com.apple.access_ssh
+
+          # Put our settings before existing configuration.
+          {
+            echo "PasswordAuthentication yes"
+            echo "KbdInteractiveAuthentication no"
+            echo "UsePAM yes"
+            echo "PermitRootLogin no"
+            echo "AllowUsers $SSH_USER"
+            cat "$SSHD_CONFIG"
+          } > "$TEMP_CONFIG"
+
+          sudo install -m 644 "$TEMP_CONFIG" "$SSHD_CONFIG"
+          rm -f "$TEMP_CONFIG"
+
+          # Check configuration before starting SSH.
+          sudo /usr/sbin/sshd -t
+
+          # Enable macOS Remote Login.
+          sudo systemsetup -setremotelogin on
+
+          # Restart SSH daemon.
+          sudo launchctl kickstart -k system/com.openssh.sshd
+
+          echo "SSH configuration completed."
+
+      - name: Verify SSH service
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for SSH..."
+
+          for attempt in {1..30}; do
+            if nc -z 127.0.0.1 22; then
+              echo "SSH is listening on port 22."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "SSH did not start."
+          exit 1
+
+      - name: Build Tailscale connection
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:maccloud
+
+      - name: Display connection information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for Tailscale IP..."
+
+          TS_IP=""
+
+          for attempt in {1..30}; do
+            TS_IP="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+
+            if [[ -n "$TS_IP" ]]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [[ -z "$TS_IP" ]]; then
+            echo "Could not obtain Tailscale IP."
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================="
+          echo "          MACCLOUD ONLINE"
+          echo "=================================="
+          echo ""
+          echo "SSH Address: $TS_IP"
+          echo "SSH Username: maccloud"
+          echo "SSH Port: 22"
+          echo ""
+          echo "Connect using:"
+          echo "ssh maccloud@$TS_IP"
+          echo ""
+          echo "Enter your SSH_PASSWORD secret."
+          echo "=================================="
+
+      - name: Keep MacCloud online
+        shell: bash
+        env:
+          DURATION_MINUTES: ${{ inputs.duration }}
+        run: |
+          set -euo pipefail
+
+          SECONDS_TO_RUN=$((DURATION_MINUTES * 60))
+
+          echo "MacCloud will stay online for $DURATION_MINUTES minutes."
+
+          sleep "$SECONDS_TO_RUN"
+
+      - name: Shut down SSH
+        if: always()
+        shell: bash
+        run: |
+          echo "Shutting down MacCloud SSH..."
+
+          sudo systemsetup -setremotelogin off || true
+
+          echo "MacCloud SSH shutdown complete."
