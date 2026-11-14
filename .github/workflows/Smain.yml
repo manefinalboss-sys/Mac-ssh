@@ -1,0 +1,307 @@
+
+name: MacCloud SSH
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Online duration in minutes"
+        required: true
+        default: "180"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  maccloud:
+    name: MacCloud macOS
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout MacCloud
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Validate settings
+        shell: bash
+        env:
+          DURATION: ${{ inputs.duration }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then
+            echo "Duration must be numeric."
+            exit 1
+          fi
+
+          if (( DURATION < 15 || DURATION > 340 )); then
+            echo "Duration must be between 15 and 340 minutes."
+            exit 1
+          fi
+
+      - name: Create MacCloud SSH user
+        shell: bash
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$SSH_PASSWORD" ]]; then
+            echo "SSH_PASSWORD secret is missing."
+            exit 1
+          fi
+
+          if id maccloud >/dev/null 2>&1; then
+            echo "MacCloud user already exists."
+            exit 1
+          fi
+
+          sudo sysadminctl \
+            -addUser maccloud \
+            -fullName "MacCloud User" \
+            -password "$SSH_PASSWORD"
+
+          id maccloud
+
+      - name: Configure MacCloud terminal and workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HOME_DIR="/Users/maccloud"
+          WORKSPACE="/Users/Shared/MacCloudWorkspace"
+
+          # Configure the machine hostname.
+          sudo scutil --set ComputerName "MacBook Pro"
+          sudo scutil --set LocalHostName "MacBook-Pro"
+          sudo scutil --set HostName "MacBook-Pro"
+
+          # Create shared workspace.
+          sudo mkdir -p "$WORKSPACE"
+          sudo chown "$(id -un)":staff "$WORKSPACE"
+          sudo chmod 2775 "$WORKSPACE"
+
+          # Give maccloud access through the staff group.
+          sudo dseditgroup -o edit -a maccloud -t user staff
+
+          # Make the workspace available in the SSH user's home.
+          sudo ln -s "$WORKSPACE" "$HOME_DIR/Workspace"
+
+          # Install custom Zsh configuration.
+          sudo tee "$HOME_DIR/.zshrc" > /dev/null <<'EOF'
+          autoload -Uz colors && colors
+
+          export CLICOLOR=1
+          export TERM="${TERM:-xterm-256color}"
+
+          PROMPT='%F{green} MacCloud%f %F{cyan}%n@MacBook-Pro%f %F{blue}%~%f
+          %F{magenta}➜%f '
+
+          alias ll='ls -lah'
+          alias cls='clear'
+          alias macinfo='sw_vers && uname -a'
+          alias projects='cd ~/Workspace'
+
+          EOF
+
+          sudo chown maccloud:staff "$HOME_DIR/.zshrc"
+          sudo chmod 644 "$HOME_DIR/.zshrc"
+
+          sudo chsh -s /bin/zsh maccloud
+
+          echo "Terminal and workspace configured."
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SSHD_CONFIG="/etc/ssh/sshd_config"
+          TEMP_CONFIG="$(mktemp)"
+
+          sudo dseditgroup -o create com.apple.access_ssh 2>/dev/null || true
+
+          sudo dseditgroup \
+            -o edit \
+            -a maccloud \
+            -t user \
+            com.apple.access_ssh
+
+          {
+            echo "PasswordAuthentication yes"
+            echo "KbdInteractiveAuthentication no"
+            echo "UsePAM yes"
+            echo "PermitRootLogin no"
+            echo "AllowUsers maccloud"
+            cat "$SSHD_CONFIG"
+          } > "$TEMP_CONFIG"
+
+          sudo install -m 644 "$TEMP_CONFIG" "$SSHD_CONFIG"
+          rm -f "$TEMP_CONFIG"
+
+          sudo /usr/sbin/sshd -t
+          sudo systemsetup -setremotelogin on
+          sudo launchctl kickstart -k system/com.openssh.sshd
+
+          echo "SSH configured."
+
+      - name: Verify SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..30}; do
+            if nc -z 127.0.0.1 22; then
+              echo "SSH ready."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "SSH failed to start."
+          exit 1
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:maccloud
+
+      - name: Restore persistent workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKSPACE="/Users/Shared/MacCloudWorkspace"
+
+          echo "Checking persistent storage..."
+
+          if git fetch origin refs/heads/maccloud-data:refs/remotes/origin/maccloud-data; then
+            echo "Previous workspace found."
+
+            git checkout -B maccloud-data origin/maccloud-data
+
+            if [[ -d workspace ]]; then
+              rsync -a --delete \
+                --exclude='.git/' \
+                --exclude='.ssh/' \
+                --exclude='.env' \
+                --exclude='.env.*' \
+                --exclude='*.pem' \
+                --exclude='*.key' \
+                --exclude='*.p12' \
+                --exclude='*.mobileprovision' \
+                --exclude='node_modules/' \
+                --exclude='DerivedData/' \
+                --exclude='.cache/' \
+                workspace/ "$WORKSPACE/"
+            fi
+          else
+            echo "No saved workspace branch found. Starting fresh."
+          fi
+
+          echo "Workspace restored."
+
+      - name: Display MacCloud connection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TS_IP=""
+
+          for attempt in {1..30}; do
+            TS_IP="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+
+            if [[ -n "$TS_IP" ]]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [[ -z "$TS_IP" ]]; then
+            echo "Tailscale IP unavailable."
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================="
+          echo "          MACCLOUD ONLINE"
+          echo "=================================="
+          echo "Machine: MacBook Pro"
+          echo "User: maccloud"
+          echo "IP: $TS_IP"
+          echo "Port: 22"
+          echo ""
+          echo "SSH: ssh maccloud@$TS_IP"
+          echo "Workspace: ~/Workspace"
+          echo "=================================="
+
+      - name: Keep MacCloud online
+        shell: bash
+        env:
+          DURATION: ${{ inputs.duration }}
+        run: |
+          set -euo pipefail
+
+          echo "MacCloud running for $DURATION minutes."
+          sleep "$((DURATION * 60))"
+
+      - name: Save persistent workspace
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKSPACE="/Users/Shared/MacCloudWorkspace"
+
+          echo "Saving MacCloud workspace..."
+
+          # Return to the storage branch if it exists.
+          if git fetch origin refs/heads/maccloud-data:refs/remotes/origin/maccloud-data; then
+            git checkout -B maccloud-data origin/maccloud-data
+          else
+            git switch --orphan maccloud-data
+            git rm -rf . 2>/dev/null || true
+          fi
+
+          mkdir -p workspace
+
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.ssh/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='*.pem' \
+            --exclude='*.key' \
+            --exclude='*.p12' \
+            --exclude='*.mobileprovision' \
+            --exclude='node_modules/' \
+            --exclude='DerivedData/' \
+            --exclude='.cache/' \
+            "$WORKSPACE/" workspace/
+
+          git config user.name "MacCloud"
+          git config user.email "maccloud@users.noreply.github.com"
+
+          git add -A workspace
+
+          if git diff --cached --quiet; then
+            echo "No workspace changes to save."
+          else
+            git commit -m "MacCloud workspace backup"
+            git push origin HEAD:maccloud-data
+            echo "Workspace backup uploaded."
+          fi
+
+      - name: Shut down SSH
+        if: always()
+        shell: bash
+        run: |
+          echo "Shutting down MacCloud SSH..."
+          sudo systemsetup -setremotelogin off || true
+          echo "SSH shutdown complete."
