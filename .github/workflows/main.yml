@@ -1,0 +1,122 @@
+
+name: MacCloud SSH
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Online duration in minutes"
+        required: true
+        default: "180"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  maccloud:
+    name: macOS Cloud SSH
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Validate configuration
+        shell: bash
+        env:
+          DURATION: ${{ inputs.duration }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          TS_KEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if ! [[ "$DURATION" =~ ^[0-9]+$ ]] ||
+             (( DURATION < 15 || DURATION > 340 )); then
+            echo "Invalid duration."
+            exit 1
+          fi
+
+          if [[ -z "$SSH_PASSWORD" || -z "$TS_KEY" ]]; then
+            echo "Missing required secrets."
+            exit 1
+          fi
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: tag:maccloud
+
+      - name: Configure macOS password
+        shell: bash
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          USER_NAME="$(id -un)"
+
+          # Set password for the current macOS account
+          sudo dscl . -passwd "/Users/$USER_NAME" "$SSH_PASSWORD"
+
+          echo "Password configured for $USER_NAME"
+
+      - name: Enable password SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CONFIG="/etc/ssh/sshd_config"
+
+          set_option() {
+            local key="$1"
+            local value="$2"
+
+            if sudo grep -qiE "^[#[:space:]]*${key}[[:space:]]+" "$CONFIG"; then
+              sudo sed -i '' -E \
+                "s|^[#[:space:]]*${key}[[:space:]]+.*|${key} ${value}|I" \
+                "$CONFIG"
+            else
+              echo "${key} ${value}" | sudo tee -a "$CONFIG" >/dev/null
+            fi
+          }
+
+          set_option PasswordAuthentication yes
+          set_option KbdInteractiveAuthentication no
+          set_option PermitRootLogin no
+
+          sudo systemsetup -setremotelogin on
+
+          sudo sshd -t
+          sudo launchctl kickstart -k system/com.openssh.sshd
+
+          echo "Password SSH enabled."
+
+      - name: Show connection information
+        shell: bash
+        run: |
+          echo "=================================="
+          echo "          MACCLOUD ONLINE"
+          echo "=================================="
+
+          echo "Username: $(id -un)"
+          echo "Tailscale IP: $(tailscale ip -4)"
+          echo "SSH Port: 22"
+          echo ""
+          echo "Connect using:"
+          echo "ssh $(id -un)@$(tailscale ip -4)"
+          echo "=================================="
+
+          sw_vers
+          uname -m
+
+      - name: Keep machine online
+        shell: bash
+        env:
+          DURATION: ${{ inputs.duration }}
+        run: |
+          echo "MacCloud running for $DURATION minutes."
+          sleep "$((DURATION * 60))"
+
+      - name: Disable SSH
+        if: always()
+        shell: bash
+        run: |
+          sudo systemsetup -setremotelogin off || true
